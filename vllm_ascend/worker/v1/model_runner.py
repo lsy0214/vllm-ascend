@@ -6695,6 +6695,8 @@ class NPUModelRunner(GPUModelRunner):
                     getattr(attn_module, "impl", None), "enable_sparse_sfa_c8", False
                 ) or getattr(
                     getattr(attn_module, "impl", None), "enable_sparse_sfa_turboquant", False
+                ) or getattr(
+                    getattr(attn_module, "impl", None), "enable_sparse_sfa_fp4", False
                 ):
                     impl = attn_module.impl
                     cache_sparse_sfa_c8 = bool(
@@ -6703,7 +6705,13 @@ class NPUModelRunner(GPUModelRunner):
                     cache_sparse_sfa_turboquant = bool(
                         getattr(impl, "enable_sparse_sfa_turboquant", False)
                     )
-                    if cache_sparse_sfa_turboquant:
+                    cache_sparse_sfa_fp4 = bool(
+                        getattr(impl, "enable_sparse_sfa_fp4", False)
+                    )
+                    if cache_sparse_sfa_fp4:
+                        head_size = 320
+                        dtype = torch.uint8
+                    elif cache_sparse_sfa_turboquant:
                         head_size = get_tq_fused_slot_bytes(
                             self.model_config.hf_text_config.kv_lora_rank,
                             self.model_config.hf_text_config.qk_rope_head_dim,
@@ -6735,6 +6743,7 @@ class NPUModelRunner(GPUModelRunner):
                         cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                         cache_sparse_sfa_c8=cache_sparse_sfa_c8,
                         cache_sparse_sfa_turboquant=cache_sparse_sfa_turboquant,
+                        cache_sparse_sfa_fp4=cache_sparse_sfa_fp4,
                         store_on_host=self.sparse_kv_offload_enabled,
                         model_version=model_version,
                         indexes_kv_by_block_stride=indexes_kv_by_block_stride,

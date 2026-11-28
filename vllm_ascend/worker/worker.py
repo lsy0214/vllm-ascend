@@ -216,6 +216,9 @@ class NPUWorker(WorkerBase):
 
         if self.cache_config.cache_dtype == "auto":
             self.cache_dtype = self.model_config.dtype
+        elif self.cache_config.cache_dtype == "mxfp4":
+            # Packed MXFP4 main KV cache: the physical tensor is raw bytes.
+            self.cache_dtype = torch.uint8
         else:
             self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[self.cache_config.cache_dtype]
 

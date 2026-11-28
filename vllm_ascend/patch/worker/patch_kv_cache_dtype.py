@@ -85,7 +85,7 @@ def _widen_cache_dtype_literal_for_worker() -> None:
     from vllm.config.cache import CacheConfig
 
     existing_args = getattr(_cache_mod.CacheDType, "__args__", ())
-    missing = tuple(d for d in ("int8", "mxfp8") if d not in existing_args)
+    missing = tuple(d for d in ("int8", "mxfp8", "mxfp4") if d not in existing_args)
     if missing:
         # Derive from the current upstream Literal and append the Ascend-only
         # dtypes so no upstream member is dropped.
@@ -111,6 +111,8 @@ def _widen_cache_dtype_literal_for_worker() -> None:
     # mapping must exist even though the C8 caches are allocated as raw int8
     # bytes.
     _torch_utils.STR_DTYPE_TO_TORCH_DTYPE.setdefault("mxfp8", torch.float8_e4m3fn)
+    # Packed MXFP4 main KV pages are raw bytes at the tensor level.
+    _torch_utils.STR_DTYPE_TO_TORCH_DTYPE.setdefault("mxfp4", torch.uint8)
 
     # Unconditional rebind: the selector's module-global CacheDType must point
     # at the widened Literal regardless of import order / fork inheritance.
@@ -156,3 +158,39 @@ def _widen_indexer_kv_dtype_literal_for_worker() -> None:
 _apply_fp8_kv_cache_dtype_flip()
 _widen_cache_dtype_literal_for_worker()
 _widen_indexer_kv_dtype_literal_for_worker()
+
+
+def _patch_mxfp4_mla_page_size() -> None:
+    """Report the packed MXFP4 MLA row size to upstream block alignment.
+
+    ``Platform._align_hybrid_block_size`` sizes a one-token MLA page as
+    ``head_size * dtype_size``. The packed MXFP4 row is ``head_size * 5 / 8``
+    bytes (4-bit payload + one BF16 scale per 16 values), i.e. 320 B for the
+    512-wide latent. Only that temporary one-token spec has head_size 512 with
+    cache_dtype_str "mxfp4"; the real Ascend spec publishes 320 as its head
+    size and keeps the normal path.
+    """
+    try:
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    except ImportError:  # pragma: no cover - depends on the vllm build
+        return
+
+    current = MLAAttentionSpec.page_size_bytes
+    if getattr(current.fget, "_ascend_mxfp4", False):
+        return
+    original = current.fget
+
+    def page_size_bytes(self):
+        if (
+            getattr(self, "cache_dtype_str", None) == "mxfp4"
+            and getattr(self, "head_size", 0) == 512
+            and getattr(self, "page_size_padded", None) is None
+        ):
+            return self.block_size * self.num_kv_heads * 320
+        return original(self)
+
+    page_size_bytes._ascend_mxfp4 = True  # type: ignore[attr-defined]
+    MLAAttentionSpec.page_size_bytes = property(page_size_bytes)
+
+
+_patch_mxfp4_mla_page_size()

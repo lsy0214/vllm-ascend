@@ -70,6 +70,7 @@ _CACHE_DTYPE_WITH_ASCEND = typing.Literal[
     "nvfp4_4over6",
     "int8",
     "mxfp8",
+    "mxfp4",
 ]
 
 
@@ -98,7 +99,7 @@ def _apply_kv_cache_dtype_int8_patch() -> None:
     """
     # Idempotency: if int8 is already accepted, nothing to do.
     existing_args = getattr(_ORIG_CACHE_DTYPE, "__args__", ())
-    if "int8" in existing_args and "mxfp8" in existing_args:
+    if "int8" in existing_args and "mxfp8" in existing_args and "mxfp4" in existing_args:
         return
 
     _cache_mod.CacheDType = _CACHE_DTYPE_WITH_ASCEND
@@ -114,7 +115,45 @@ def _apply_kv_cache_dtype_int8_patch() -> None:
         raise_errors=True,
         _parent_namespace_depth=1,
     )
-    logger.info("Patched CacheConfig.cache_dtype to accept 'int8' and 'mxfp8' (Ascend KV cache dtypes).")
+    logger.info(
+        "Patched CacheConfig.cache_dtype to accept 'int8', 'mxfp8' and 'mxfp4' (Ascend KV cache dtypes)."
+    )
 
 
 _apply_kv_cache_dtype_int8_patch()
+
+
+def _patch_mxfp4_mla_page_size() -> None:
+    """Report the packed MXFP4 MLA row size to upstream block alignment.
+
+    ``Platform._align_hybrid_block_size`` sizes a one-token MLA page as
+    ``head_size * dtype_size``. The packed MXFP4 row is ``head_size * 5 / 8``
+    bytes (4-bit payload + one BF16 scale per 16 values), i.e. 320 B for the
+    512-wide latent. Only that temporary one-token spec has head_size 512 with
+    cache_dtype_str "mxfp4"; the real Ascend spec publishes 320 as its head
+    size and keeps the normal path.
+    """
+    try:
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    except ImportError:  # pragma: no cover - depends on the vllm build
+        return
+
+    current = MLAAttentionSpec.page_size_bytes
+    if getattr(current.fget, "_ascend_mxfp4", False):
+        return
+    original = current.fget
+
+    def page_size_bytes(self):
+        if (
+            getattr(self, "cache_dtype_str", None) == "mxfp4"
+            and getattr(self, "head_size", 0) == 512
+            and getattr(self, "page_size_padded", None) is None
+        ):
+            return self.block_size * self.num_kv_heads * 320
+        return original(self)
+
+    page_size_bytes._ascend_mxfp4 = True  # type: ignore[attr-defined]
+    MLAAttentionSpec.page_size_bytes = property(page_size_bytes)
+
+
+_patch_mxfp4_mla_page_size()

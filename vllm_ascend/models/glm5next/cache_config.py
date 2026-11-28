@@ -173,7 +173,19 @@ def _create_glm5_next_attention_groups(
 
     full_block_sizes = {kv_cache_spec[name].block_size for name in (*main_names, *indexer_names)}
     if len(full_block_sizes) != 1:
-        raise ValueError("GLM-Next main MLA and compressed indexer caches must use one logical block size.")
+        raise ValueError(
+            "GLM-Next main MLA and compressed indexer caches must use one logical block size: "
+            + str(
+                {
+                    name: (
+                        kv_cache_spec[name].block_size,
+                        kv_cache_spec[name].head_size,
+                        str(kv_cache_spec[name].dtype),
+                    )
+                    for name in (*main_names, *indexer_names)
+                }
+            )
+        )
 
     for main_name, indexer_name, tail_name in zip(main_names, indexer_names, tail_names):
         main_spec = kv_cache_spec[main_name]

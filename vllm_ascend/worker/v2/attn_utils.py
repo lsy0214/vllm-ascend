@@ -267,9 +267,14 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         if isinstance(attn_module, MLAAttention):
             cache_sparse_sfa_c8 = False
             cache_sparse_sfa_turboquant = False
+            cache_sparse_sfa_fp4 = False
             if getattr(attn_module.impl, "fa_quant_layer", False):
                 head_size = attn_module.head_size + attn_module.qk_rope_head_dim
                 dtype, cache_dtype_str = attn_module.impl.dtype, None
+            elif enable_sfa(vllm_config) and bool(getattr(attn_module.impl, "enable_sparse_sfa_fp4", False)):
+                cache_sparse_sfa_fp4 = True
+                head_size = 320
+                dtype, cache_dtype_str = torch.uint8, vllm_config.cache_config.cache_dtype
             elif enable_sfa(vllm_config) and bool(getattr(attn_module.impl, "enable_sparse_sfa_turboquant", False)):
                 cache_sparse_sfa_turboquant = True
                 head_size = get_tq_fused_slot_bytes(
@@ -314,6 +319,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 cache_sparse_sfa_c8=cache_sparse_sfa_c8,
                 store_on_host=enable_sfa(vllm_config) and get_ascend_config().sparse_kv_offload_config.enabled,
                 cache_sparse_sfa_turboquant=cache_sparse_sfa_turboquant,
+                cache_sparse_sfa_fp4=cache_sparse_sfa_fp4,
                 non_causal_multi_token_decode=spec.non_causal_multi_token_decode,
                 model_version=model_version,
                 indexes_kv_by_block_stride=indexes_kv_by_block_stride,

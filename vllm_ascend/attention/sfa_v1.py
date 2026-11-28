@@ -28,6 +28,7 @@ from vllm_ascend.attention.context_parallel.common_cp import (
     get_pcp_num_replicated_tokens,
     is_pcp_decode_sharding_enabled,
 )
+from vllm_ascend.attention.mxfp4_sparse_mla import fp4_sparse_mla, write_fp4_kv_cache
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
 from vllm_ascend.attention.utils import (
     MLAPO_MAX_SUPPORTED_TOKENS,
@@ -257,10 +258,15 @@ class SparseMLAMetadataState:
         if block_size <= 0 or block_size % kernel_block_size:
             raise ValueError("Sparse MLA block size must be a positive multiple of the SFA kernel block size.")
         self.split = block_size // kernel_block_size
+        self.use_fp4 = bool(getattr(get_ascend_config(), "enable_sparse_sfa_fp4", False))
         self.use_smla = get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
         if self.use_smla:
             config = get_ascend_config()
             self.use_smla = not (config.enable_sparse_sfa_c8 or config.enable_sparse_sfa_turboquant)
+        if self.use_fp4:
+            # The CMP-only path reuses the length/valid buffers below but not
+            # the BF16 operator plan or its sinks.
+            self.use_smla = True
         self.block_size = kernel_block_size
         self.table_stride = 1
         cache_block_size = vllm_config.cache_config.block_size
@@ -870,6 +876,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                 self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config
             )
 
+        self.enable_sparse_sfa_fp4 = bool(getattr(ascend_config, "enable_sparse_sfa_fp4", False))
+        if self.enable_sparse_sfa_fp4:
+            if self.enable_sparse_sfa_c8 or self.enable_sparse_sfa_turboquant:
+                raise ValueError(
+                    "enable_sparse_sfa_fp4 is mutually exclusive with the C8 and TurboQuant SFA caches."
+                )
+            if self.qk_rope_head_dim != 0 or self.kv_lora_rank != 512:
+                raise ValueError(
+                    "The FP4 SFA cache requires a no-rope MLA latent with kv_lora_rank=512, "
+                    f"got qk_rope_head_dim={self.qk_rope_head_dim}, kv_lora_rank={self.kv_lora_rank}."
+                )
+
         if self.enable_sparse_sfa_turboquant:
             self.sfa_qsfa_packed_kv_head_dim = get_tq_fused_slot_bytes(self.kv_lora_rank, self.qk_rope_head_dim)
         elif self.enable_sparse_sfa_c8:
@@ -888,7 +906,11 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     @property
     def uses_packed_sfa_main_cache(self) -> bool:
-        return bool(self.enable_sparse_sfa_c8 or self.enable_sparse_sfa_turboquant)
+        return bool(
+            self.enable_sparse_sfa_c8
+            or self.enable_sparse_sfa_turboquant
+            or self.enable_sparse_sfa_fp4
+        )
 
     @property
     def skip_topk(self) -> bool:
@@ -991,6 +1013,10 @@ class AscendSFAImpl(MLAAttentionImpl):
         return getattr(getattr(layer, "quant_method", None), "quant_method", None)
 
     def _resolve_preprocess_type(self, act_dtype: torch.dtype) -> PreprocessType:
+        if self.enable_sparse_sfa_fp4:
+            # exec_kv owns the FP4 cache store (RMSNorm + kv_compress_epilog);
+            # the fused prologs write their own cache formats.
+            return PreprocessType.NATIVE
         quant_method = self._get_layer_quant_method(self.fused_qkv_a_proj)
         self._quant_type = type(quant_method) if quant_method is not None else None
 
@@ -1269,6 +1295,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         slots: torch.Tensor,
         attn_metadata: M,
     ):
+        if self.qk_rope_head_dim == 0 and self.enable_sparse_sfa_fp4:
+            assert self.kv_a_layernorm is not None
+            values = self.kv_a_layernorm(kv_no_split.reshape(-1, self.kv_lora_rank))
+            write_fp4_kv_cache(kv_cache[0], values, slots[: values.shape[0]])
+            return None, None
         if self.qk_rope_head_dim == 0 and not self.enable_sparse_sfa_c8:
             assert self.kv_a_layernorm is not None
             values = self.kv_a_layernorm(kv_no_split.reshape(-1, self.kv_lora_rank))
@@ -1658,6 +1689,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         actual_seq_lengths_key,
         block_table=None,
     ):
+        if self.enable_sparse_sfa_fp4:
+            return fp4_sparse_mla(
+                ql_nope.contiguous(),
+                kv_cache[0],
+                topk_indices,
+                attn_metadata,
+                self.scale,
+            )
         if self.enable_sparse_sfa_turboquant:
             attn_out, _, _ = self._turboquant_sfa(
                 self._tq_rotate_query(ql_nope, q_pe),
@@ -1710,7 +1749,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         torch.Tensor | None,
     ]:
         """Store KV produced by native preprocessing."""
-        if self.uses_packed_sfa_main_cache:
+        if self.uses_packed_sfa_main_cache and not self.enable_sparse_sfa_fp4:
             assert k_pe is not None
             assert k_nope is not None
             assert knope_scale is not None
